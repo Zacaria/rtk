@@ -11,6 +11,7 @@ const REWRITE_HOOK: &str = include_str!("../hooks/rtk-rewrite.sh");
 
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
+const RTK_SLIM_CODEX: &str = include_str!("../hooks/rtk-awareness-codex.md");
 
 /// Control flow for settings.json patching
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -170,14 +171,21 @@ pub fn run(
     global: bool,
     claude_md: bool,
     hook_only: bool,
+    codex: bool,
     patch_mode: PatchMode,
     verbose: u8,
 ) -> Result<()> {
-    // Mode selection
-    match (claude_md, hook_only) {
-        (true, _) => run_claude_md_mode(global, verbose),
-        (false, true) => run_hook_only_mode(global, patch_mode, verbose),
-        (false, false) => run_default_mode(global, patch_mode, verbose),
+    match (codex, claude_md, hook_only) {
+        (true, true, _) => anyhow::bail!("--codex cannot be combined with --claude-md"),
+        (true, _, true) => anyhow::bail!("--codex cannot be combined with --hook-only"),
+        (true, _, false) => match patch_mode {
+            PatchMode::Ask => run_codex_mode(global, verbose),
+            PatchMode::Auto => anyhow::bail!("--codex cannot be combined with --auto-patch"),
+            PatchMode::Skip => anyhow::bail!("--codex cannot be combined with --no-patch"),
+        },
+        (false, true, _) => run_claude_md_mode(global, verbose),
+        (false, false, true) => run_hook_only_mode(global, patch_mode, verbose),
+        (false, false, false) => run_default_mode(global, patch_mode, verbose),
     }
 }
 
@@ -410,8 +418,16 @@ fn remove_hook_from_settings(verbose: u8) -> Result<bool> {
     Ok(removed)
 }
 
-/// Full uninstall: remove hook, RTK.md, @RTK.md reference, settings.json entry
-pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
+/// Full uninstall for Claude or Codex artifacts.
+pub fn uninstall(global: bool, codex: bool, verbose: u8) -> Result<()> {
+    if codex {
+        return uninstall_codex(global, verbose);
+    }
+
+    uninstall_claude(global, verbose)
+}
+
+fn uninstall_claude(global: bool, verbose: u8) -> Result<()> {
     if !global {
         anyhow::bail!("Uninstall only works with --global flag. For local projects, manually remove RTK from CLAUDE.md");
     }
@@ -480,6 +496,49 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn uninstall_codex(global: bool, verbose: u8) -> Result<()> {
+    if !global {
+        anyhow::bail!(
+            "Uninstall only works with --global flag. For local projects, manually remove RTK from AGENTS.md"
+        );
+    }
+
+    let codex_dir = resolve_codex_dir()?;
+    let removed = uninstall_codex_at(&codex_dir, verbose)?;
+
+    if removed.is_empty() {
+        println!("RTK was not installed for Codex CLI (nothing to remove)");
+    } else {
+        println!("RTK uninstalled for Codex CLI:");
+        for item in removed {
+            println!("  - {}", item);
+        }
+    }
+
+    Ok(())
+}
+
+fn uninstall_codex_at(codex_dir: &Path, verbose: u8) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+
+    let rtk_md_path = codex_dir.join("RTK.md");
+    if rtk_md_path.exists() {
+        fs::remove_file(&rtk_md_path)
+            .with_context(|| format!("Failed to remove RTK.md: {}", rtk_md_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Removed RTK.md: {}", rtk_md_path.display());
+        }
+        removed.push(format!("RTK.md: {}", rtk_md_path.display()));
+    }
+
+    let agents_md_path = codex_dir.join("AGENTS.md");
+    if remove_rtk_reference_from_agents(&agents_md_path, verbose)? {
+        removed.push("AGENTS.md: removed @RTK.md reference".to_string());
+    }
+
+    Ok(removed)
 }
 
 /// Orchestrator: patch settings.json with RTK hook
@@ -849,6 +908,51 @@ fn run_claude_md_mode(global: bool, verbose: u8) -> Result<()> {
     Ok(())
 }
 
+/// Codex mode: slim RTK.md + @RTK.md reference in AGENTS.md
+fn run_codex_mode(global: bool, verbose: u8) -> Result<()> {
+    let (agents_md_path, rtk_md_path) = if global {
+        let codex_dir = resolve_codex_dir()?;
+        (codex_dir.join("AGENTS.md"), codex_dir.join("RTK.md"))
+    } else {
+        (PathBuf::from("AGENTS.md"), PathBuf::from("RTK.md"))
+    };
+
+    if global {
+        if let Some(parent) = agents_md_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create Codex config directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    write_if_changed(&rtk_md_path, RTK_SLIM_CODEX, "RTK.md", verbose)?;
+    let added_ref = patch_agents_md(&agents_md_path, verbose)?;
+
+    println!("\nRTK configured for Codex CLI.\n");
+    println!("  RTK.md:    {}", rtk_md_path.display());
+    if added_ref {
+        println!("  AGENTS.md: @RTK.md reference added");
+    } else {
+        println!("  AGENTS.md: @RTK.md reference already present");
+    }
+    if global {
+        println!(
+            "\n  Codex global instructions path: {}",
+            agents_md_path.display()
+        );
+    } else {
+        println!(
+            "\n  Codex project instructions path: {}",
+            agents_md_path.display()
+        );
+    }
+
+    Ok(())
+}
+
 // --- upsert_rtk_block: idempotent RTK block management ---
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -961,6 +1065,83 @@ fn patch_claude_md(path: &Path, verbose: u8) -> Result<bool> {
     Ok(migrated)
 }
 
+/// Patch AGENTS.md: add @RTK.md, migrate old inline block if present
+fn patch_agents_md(path: &Path, verbose: u8) -> Result<bool> {
+    let mut content = if path.exists() {
+        fs::read_to_string(path)
+            .with_context(|| format!("Failed to read AGENTS.md: {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut migrated = false;
+    if content.contains("<!-- rtk-instructions") {
+        let (new_content, did_migrate) = remove_rtk_block(&content);
+        if did_migrate {
+            content = new_content;
+            migrated = true;
+            if verbose > 0 {
+                eprintln!("Migrated: removed old RTK block from AGENTS.md");
+            }
+        }
+    }
+
+    if content.contains("@RTK.md") {
+        if verbose > 0 {
+            eprintln!("@RTK.md reference already present in AGENTS.md");
+        }
+        if migrated {
+            atomic_write(path, &content)
+                .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
+        }
+        return Ok(false);
+    }
+
+    let new_content = if content.is_empty() {
+        "@RTK.md\n".to_string()
+    } else {
+        format!("{}\n\n@RTK.md\n", content.trim())
+    };
+
+    atomic_write(path, &new_content)
+        .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
+    if verbose > 0 {
+        eprintln!("Added @RTK.md reference to AGENTS.md");
+    }
+
+    Ok(true)
+}
+
+fn remove_rtk_reference_from_agents(path: &Path, verbose: u8) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read AGENTS.md: {}", path.display()))?;
+    if !content.contains("@RTK.md") {
+        return Ok(false);
+    }
+
+    let new_content = content
+        .lines()
+        .filter(|line| !line.trim().starts_with("@RTK.md"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cleaned = clean_double_blanks(&new_content);
+    atomic_write(path, &cleaned)
+        .with_context(|| format!("Failed to write AGENTS.md: {}", path.display()))?;
+
+    if verbose > 0 {
+        eprintln!(
+            "Removed @RTK.md reference from AGENTS.md: {}",
+            path.display()
+        );
+    }
+
+    Ok(true)
+}
+
 /// Remove old RTK block from CLAUDE.md (migration helper)
 fn remove_rtk_block(content: &str) -> (String, bool) {
     if let (Some(start), Some(end)) = (
@@ -1006,8 +1187,23 @@ fn resolve_claude_dir() -> Result<PathBuf> {
         .context("Cannot determine home directory. Is $HOME set?")
 }
 
+/// Resolve ~/.codex directory with proper home expansion
+fn resolve_codex_dir() -> Result<PathBuf> {
+    dirs::home_dir()
+        .map(|h| h.join(".codex"))
+        .context("Cannot determine home directory. Is $HOME set?")
+}
+
 /// Show current rtk configuration
-pub fn show_config() -> Result<()> {
+pub fn show_config(codex: bool) -> Result<()> {
+    if codex {
+        return show_codex_config();
+    }
+
+    show_claude_config()
+}
+
+fn show_claude_config() -> Result<()> {
     let claude_dir = resolve_claude_dir()?;
     let hook_path = claude_dir.join("hooks").join("rtk-rewrite.sh");
     let rtk_md_path = claude_dir.join("RTK.md");
@@ -1147,6 +1343,63 @@ pub fn show_config() -> Result<()> {
     println!("  rtk init -g --uninstall     # Remove all RTK artifacts");
     println!("  rtk init -g --claude-md     # Legacy: full injection into ~/.claude/CLAUDE.md");
     println!("  rtk init -g --hook-only     # Hook only, no RTK.md");
+    println!("  rtk init --codex            # Configure local AGENTS.md + RTK.md");
+    println!("  rtk init -g --codex         # Configure ~/.codex/AGENTS.md + ~/.codex/RTK.md");
+
+    Ok(())
+}
+
+fn show_codex_config() -> Result<()> {
+    let codex_dir = resolve_codex_dir()?;
+    let global_agents_md = codex_dir.join("AGENTS.md");
+    let global_rtk_md = codex_dir.join("RTK.md");
+    let local_agents_md = PathBuf::from("AGENTS.md");
+    let local_rtk_md = PathBuf::from("RTK.md");
+
+    println!("rtk Configuration (Codex CLI):\n");
+
+    if global_rtk_md.exists() {
+        println!("[ok] Global RTK.md: {}", global_rtk_md.display());
+    } else {
+        println!("[--] Global RTK.md: not found");
+    }
+
+    if global_agents_md.exists() {
+        let content = fs::read_to_string(&global_agents_md)?;
+        if content.contains("@RTK.md") {
+            println!("[ok] Global AGENTS.md: @RTK.md reference");
+        } else if content.contains("<!-- rtk-instructions") {
+            println!("[!!] Global AGENTS.md: old inline RTK block");
+        } else {
+            println!("[--] Global AGENTS.md: exists but rtk not configured");
+        }
+    } else {
+        println!("[--] Global AGENTS.md: not found");
+    }
+
+    if local_rtk_md.exists() {
+        println!("[ok] Local RTK.md: {}", local_rtk_md.display());
+    } else {
+        println!("[--] Local RTK.md: not found");
+    }
+
+    if local_agents_md.exists() {
+        let content = fs::read_to_string(&local_agents_md)?;
+        if content.contains("@RTK.md") {
+            println!("[ok] Local AGENTS.md: @RTK.md reference");
+        } else if content.contains("<!-- rtk-instructions") {
+            println!("[!!] Local AGENTS.md: old inline RTK block");
+        } else {
+            println!("[--] Local AGENTS.md: exists but rtk not configured");
+        }
+    } else {
+        println!("[--] Local AGENTS.md: not found");
+    }
+
+    println!("\nUsage:");
+    println!("  rtk init --codex              # Configure local AGENTS.md + RTK.md");
+    println!("  rtk init -g --codex           # Configure ~/.codex/AGENTS.md + ~/.codex/RTK.md");
+    println!("  rtk init -g --codex --uninstall  # Remove global Codex RTK artifacts");
 
     Ok(())
 }
@@ -1317,6 +1570,74 @@ More notes
         let content = fs::read_to_string(&claude_md).unwrap();
         let count = content.matches("@RTK.md").count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_patch_agents_md_adds_reference_once() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+
+        fs::write(&agents_md, "# Team rules\n").unwrap();
+        let first_added = patch_agents_md(&agents_md, 0).unwrap();
+        let second_added = patch_agents_md(&agents_md, 0).unwrap();
+
+        assert!(first_added);
+        assert!(!second_added);
+
+        let content = fs::read_to_string(&agents_md).unwrap();
+        assert_eq!(content.matches("@RTK.md").count(), 1);
+    }
+
+    #[test]
+    fn test_patch_agents_md_creates_missing_file() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+
+        let added = patch_agents_md(&agents_md, 0).unwrap();
+
+        assert!(added);
+        let content = fs::read_to_string(&agents_md).unwrap();
+        assert_eq!(content, "@RTK.md\n");
+    }
+
+    #[test]
+    fn test_patch_agents_md_migrates_inline_block() {
+        let temp = TempDir::new().unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        fs::write(
+            &agents_md,
+            "# Team rules\n\n<!-- rtk-instructions v2 -->\nold\n<!-- /rtk-instructions -->\n",
+        )
+        .unwrap();
+
+        let added = patch_agents_md(&agents_md, 0).unwrap();
+
+        assert!(added);
+        let content = fs::read_to_string(&agents_md).unwrap();
+        assert!(!content.contains("old"));
+        assert_eq!(content.matches("@RTK.md").count(), 1);
+    }
+
+    #[test]
+    fn test_uninstall_codex_at_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let codex_dir = temp.path();
+        let agents_md = codex_dir.join("AGENTS.md");
+        let rtk_md = codex_dir.join("RTK.md");
+
+        fs::write(&agents_md, "# Team rules\n\n@RTK.md\n").unwrap();
+        fs::write(&rtk_md, "codex config").unwrap();
+
+        let removed_first = uninstall_codex_at(codex_dir, 0).unwrap();
+        let removed_second = uninstall_codex_at(codex_dir, 0).unwrap();
+
+        assert_eq!(removed_first.len(), 2);
+        assert!(removed_second.is_empty());
+        assert!(!rtk_md.exists());
+
+        let content = fs::read_to_string(&agents_md).unwrap();
+        assert!(!content.contains("@RTK.md"));
+        assert!(content.contains("# Team rules"));
     }
 
     #[test]
